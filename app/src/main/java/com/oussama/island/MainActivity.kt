@@ -180,7 +180,9 @@ class MainActivity : Activity() {
         upd()
         refreshers.add(upd)
         card.addView(r)
-    }    /* ---------- screen ---------- */
+    }
+
+    /* ---------- screen ---------- */
     private fun build() {
         val darkAccent = floatArrayOf(0f, 0f, 0f).also {
             Color.colorToHSV(accent, it); it[2] = it[2] * 0.55f
@@ -252,6 +254,7 @@ class MainActivity : Activity() {
         switchRow(feat, "Notifications", "الإشعارات", "t_notif")
         switchRow(feat, "Incoming calls", "المكالمات الواردة", "t_call")
         switchRow(feat, "Charging & battery", "الشحن والبطارية", "t_charge")
+        switchRow(feat, "Lock / unlock animation", "حركة القفل وفتح القفل", "t_lock")
         switchRow(feat, "Adaptive color from album art", "لون متكيّف مع غلاف الأغنية", "adaptive")
         switchRow(feat, "Equalizer animation", "حركة المعادل الصوتي", "t_wave")
         switchRow(feat, "Haptic feedback", "الاهتزاز اللمسي", "haptic")
@@ -259,9 +262,10 @@ class MainActivity : Activity() {
 
         // Size & position
         val size = card(t("Size & position", "الحجم والموضع"))
-        slider(size, "Width", "العرض", "width", 100, 260, 170, " dp")
-        slider(size, "Height", "الارتفاع", "height", 30, 64, 38, " dp")
-        slider(size, "Top margin", "المسافة من الأعلى", "top", 0, 90, 10, " dp")
+        switchRow(size, "Auto-align to camera", "محاذاة تلقائية مع الكاميرا", "autopos")
+        slider(size, "Width", "العرض", "width", 90, 260, cfg.def("width"), " dp")
+        slider(size, "Height", "الارتفاع", "height", 24, 64, cfg.def("height"), " dp")
+        slider(size, "Vertical position", "الموضع العمودي", "top", 0, 90, cfg.def("top"), " dp")
         slider(size, "Horizontal shift", "الإزاحة الأفقية", "xoff", -150, 150, 0, " dp")
         slider(size, "Expanded width", "عرض الوضع الموسّع", "expw", 70, 100, 94, " %")
         slider(size, "Corner radius", "استدارة الزوايا", "radius", 12, 44, 30, " dp")
