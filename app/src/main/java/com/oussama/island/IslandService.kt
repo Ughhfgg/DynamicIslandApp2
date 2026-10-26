@@ -82,10 +82,19 @@ object Lang {
     fun t(c: Context, en: String, ar: String) = if (isAr(c)) ar else en
 }
 
-class Cfg(c: Context) {
-    val p: SharedPreferences = c.getSharedPreferences("island", Context.MODE_PRIVATE)
+class Cfg(private val ctx: Context) {
+    val p: SharedPreferences = ctx.getSharedPreferences("island", Context.MODE_PRIVATE)
     fun i(k: String, d: Int) = p.getInt(k, d)
     fun b(k: String, d: Boolean = true) = p.getBoolean(k, d)
+    private fun swDp() = ctx.resources.displayMetrics.widthPixels / ctx.resources.displayMetrics.density
+    /** Default size = same proportions as the phone's native island */
+    fun def(k: String): Int = when (k) {
+        "width" -> (swDp() * 0.345f).toInt()
+        "height" -> (swDp() * 0.082f).toInt()
+        "top" -> (swDp() * 0.019f).toInt()
+        else -> 0
+    }
+    fun d(k: String) = p.getInt(k, def(k))
 }
 
 class Notif(
@@ -149,6 +158,7 @@ class IslandService : Service() {
     private var temp: View? = null
     private var tempId = 0
     private var tempColor = Color.BLACK
+    private var tempW = 0
     private var notif: Notif? = null
     private var notifExpanded = false
     private val queue = ArrayDeque<Notif>()
@@ -194,15 +204,22 @@ class IslandService : Service() {
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL }
+        ).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            if (Build.VERSION.SDK_INT >= 28)
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
         wm.addView(root, lp)
         styleNow()
         registerReceiver(power, IntentFilter().apply {
             addAction(Intent.ACTION_POWER_CONNECTED)
             addAction(Intent.ACTION_POWER_DISCONNECTED)
             addAction(Intent.ACTION_BATTERY_LOW)
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_USER_PRESENT)
         })
         setupMedia()
     }
@@ -243,7 +260,9 @@ class IslandService : Service() {
             .build()
         if (Build.VERSION.SDK_INT >= 34) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         else startForeground(1, n)
-    }    /* ---------- helpers ---------- */
+    }
+
+    /* ---------- helpers ---------- */
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun ll(w: Int, hh: Int, wt: Float = 0f) = LinearLayout.LayoutParams(w, hh, wt)
     private fun base() = BG_PRESETS[cfg.i("bgIdx", 0).coerceIn(0, BG_PRESETS.size - 1)]
@@ -337,8 +356,20 @@ class IslandService : Service() {
 
     private fun styleNow() {
         accent = ACCENTS[cfg.i("accent", 0)]
-        lp.y = dp(cfg.i("top", 10))
-        lp.x = dp(cfg.i("xoff", 0))
+        var y = dp(cfg.d("top"))
+        var x = dp(cfg.i("xoff", 0))
+        if (cfg.b("autopos") && Build.VERSION.SDK_INT >= 30) {
+            try {
+                val m = wm.currentWindowMetrics
+                val r = m.windowInsets.displayCutout?.boundingRects?.firstOrNull { it.top <= dp(4) && it.width() < m.bounds.width() / 3 }
+                if (r != null) {
+                    y = max(0, r.centerY() - dp(cfg.d("height")) / 2)
+                    x += r.centerX() - m.bounds.width() / 2
+                }
+            } catch (_: Exception) {}
+        }
+        lp.y = y
+        lp.x = x
         root.layoutDirection = if (Lang.isAr(this)) View.LAYOUT_DIRECTION_RTL else View.LAYOUT_DIRECTION_LTR
         if (cfg.b("border", false)) bg.setStroke(dp(1), 0x33FFFFFF) else bg.setStroke(0, Color.TRANSPARENT)
         if (root.isAttachedToWindow) wm.updateViewLayout(root, lp)
@@ -350,11 +381,12 @@ class IslandService : Service() {
         try { wm.updateViewLayout(root, lp) } catch (_: Exception) {}
     }
 
-    private fun applyBox(expanded: Boolean) {
+    private fun applyBox(expanded: Boolean, wDp: Int) {
         val p = box.layoutParams as FrameLayout.LayoutParams
-        p.width = if (expanded) (resources.displayMetrics.widthPixels * cfg.i("expw", 94) / 100f).toInt() else WRAP
-        box.minimumWidth = if (expanded) 0 else dp(cfg.i("width", 170))
-        box.minimumHeight = if (expanded) 0 else dp(cfg.i("height", 38))
+        p.width = if (expanded) (resources.displayMetrics.widthPixels * cfg.i("expw", 94) / 100f).toInt()
+                  else dp(if (wDp > 0) wDp else cfg.d("width"))
+        box.minimumWidth = 0
+        box.minimumHeight = if (expanded) 0 else dp(cfg.d("height"))
         box.layoutParams = p
     }
 
@@ -380,13 +412,13 @@ class IslandService : Service() {
         curColor = target; curRad = radius
     }
 
-    private fun present(v: View, expanded: Boolean, color: Int) {
+    private fun present(v: View, expanded: Boolean, color: Int, wDp: Int = 0) {
         val appearing = root.visibility != View.VISIBLE
-        val rad = if (expanded) dp(cfg.i("radius", 30)).toFloat() else dp(cfg.i("height", 38) / 2).toFloat()
+        val rad = if (expanded) dp(cfg.i("radius", 30)).toFloat() else dp(cfg.d("height") / 2).toFloat()
         box.animate().cancel()
         if (appearing) {
             windowBig(false)
-            applyBox(expanded)
+            applyBox(expanded, wDp)
             box.removeAllViews()
             box.addView(v, ll(MATCH, WRAP))
             setBg(color, rad, false)
@@ -408,7 +440,7 @@ class IslandService : Service() {
                 override fun onTransitionEnd(transition: Transition) { windowBig(false) }
             })
             TransitionManager.beginDelayedTransition(root, set)
-            applyBox(expanded)
+            applyBox(expanded, wDp)
             box.removeAllViews()
             box.addView(v, ll(MATCH, WRAP))
             setBg(color, rad, true)
@@ -452,7 +484,7 @@ class IslandService : Service() {
         when {
             cv != null -> show("call:$callKey", true, base()) { cv }
             nf != null -> show("n:${nf.key}:$notifExpanded:${nf.text}", true, base()) { buildNotif(nf, notifExpanded) }
-            tp != null -> show("t:$tempId", false, tempColor) { tp }
+            tp != null -> show("t:$tempId", false, tempColor, tempW) { tp }
             mediaVisible() -> {
                 val expanded = mediaExpanded
                 show("m:$trackKey:$expanded:${isPlaying()}:${timerEnd > System.currentTimeMillis()}:${repeatOn}:${favs().contains(trackKey)}",
@@ -463,20 +495,22 @@ class IslandService : Service() {
         }
     }
 
-    private fun show(sig: String, expanded: Boolean, color: Int, build: () -> View) {
+    private fun show(sig: String, expanded: Boolean, color: Int, wDp: Int = 0, build: () -> View) {
         if (sig == shownSig && root.visibility == View.VISIBLE) return
         shownSig = sig
-        present(build(), expanded, color)
+        present(build(), expanded, color, wDp)
     }
 
     /* ---------- transient toasts ---------- */
     private val clearTemp = Runnable { temp = null; doRefresh() }
-    private fun setTemp(v: View, ms: Long, color: Int = Color.BLACK) {
-        temp = v; tempColor = color; tempId++
+    private fun setTemp(v: View, ms: Long, color: Int = Color.BLACK, wDp: Int = 0) {
+        temp = v; tempColor = color; tempW = wDp; tempId++
         h.removeCallbacks(clearTemp)
         h.postDelayed(clearTemp, ms)
         doRefresh()
-    }    /* ---------- notifications ---------- */
+    }
+
+    /* ---------- notifications ---------- */
     fun showNotification(n: Notif) { h.post { enqueue(n) } }
 
     private val nextR = Runnable { notif = queue.removeFirstOrNull(); notifExpanded = false; armNotif(); doRefresh() }
@@ -632,7 +666,7 @@ class IslandService : Service() {
                 } catch (_: Exception) {}
                 val r = row().apply { setPadding(dp(16), dp(6), dp(16), dp(6)); gravity = Gravity.CENTER }
                 r.addView(tv("⏱ " + t("Timer finished", "انتهى المؤقت"), 15f, Color.WHITE, true))
-                setTemp(r, 5000, base())
+                setTemp(r, 5000, base(), 200)
                 return
             }
             timerTv?.text = mmss(left)
@@ -640,9 +674,24 @@ class IslandService : Service() {
         }
     }
 
+    /* ---------- lock / unlock ---------- */
+    private fun lockToast(locked: Boolean) {
+        val r = row().apply { setPadding(dp(14), dp(6), dp(16), dp(6)); gravity = Gravity.CENTER }
+        val ic = tv(if (locked) "🔒" else "🔓", 20f)
+        r.addView(ic, ll(WRAP, WRAP).apply { marginEnd = dp(8) })
+        r.addView(tv(if (locked) t("Locked", "تم القفل") else t("Unlocked", "تم فتح القفل"), 14f, Color.WHITE, true))
+        ic.scaleX = 0.3f; ic.scaleY = 0.3f
+        ic.animate().scaleX(1f).scaleY(1f).setDuration(450).setInterpolator(OvershootInterpolator(3f)).start()
+        setTemp(r, 1800, base(), 190)
+    }
+
     /* ---------- battery ---------- */
     private val power = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
+            if (i.action == Intent.ACTION_SCREEN_OFF || i.action == Intent.ACTION_USER_PRESENT) {
+                if (cfg.b("t_lock")) lockToast(i.action == Intent.ACTION_SCREEN_OFF)
+                return
+            }
             if (!cfg.b("t_charge")) return
             val b = c.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
             val lvl = (b?.getIntExtra(BatteryManager.EXTRA_LEVEL, 0) ?: 0) * 100 /
@@ -664,7 +713,7 @@ class IslandService : Service() {
             tx.addView(pb, ll(dp(90), dp(6)).apply { topMargin = dp(4) })
             r.addView(tx, ll(0, WRAP, 1f))
             r.addView(tv("$lvl%", 18f, Color.WHITE, true), ll(WRAP, WRAP).apply { marginStart = dp(12) })
-            setTemp(r, 3500, base())
+            setTemp(r, 3500, base(), 250)
         }
     }
 
@@ -787,7 +836,7 @@ class IslandService : Service() {
     }
 
     private fun buildMediaPill(): View {
-        val hgt = cfg.i("height", 38)
+        val hgt = cfg.d("height")
         val r = row().apply { setPadding(dp(6), dp(3), dp(14), dp(3)) }
         val s = dp(hgt - 10)
         r.addView(artView(-1), ll(s, s))
