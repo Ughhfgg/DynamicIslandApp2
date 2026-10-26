@@ -6,6 +6,12 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.app.RemoteInput
+import android.hardware.camera2.CameraManager
+import android.os.Bundle
+import android.text.InputType
+import android.view.inputmethod.InputMethodManager
+import android.widget.EditText
 import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.ComponentName
@@ -177,6 +183,13 @@ class IslandService : Service() {
     private var posTv: TextView? = null
     private var seeking = false
     private var shownSig = ""
+    private var replyMode = false
+    private var replyEdit: EditText? = null
+    private var replyAction: Notification.Action? = null
+    private var torchOn = false
+    private var torchId: String? = null
+    private var torchReady = false
+    private var fallbackArt: Bitmap? = null
     private var curColor = Color.BLACK
     private var curRad = 0f
     private var colorAnim: ValueAnimator? = null
@@ -212,7 +225,7 @@ class IslandService : Service() {
             if (Build.VERSION.SDK_INT >= 28)
                 layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
         }
-        wm.addView(root, lp)
+        attachWindow()
         styleNow()
         registerReceiver(power, IntentFilter().apply {
             addAction(Intent.ACTION_POWER_CONNECTED)
@@ -222,6 +235,8 @@ class IslandService : Service() {
             addAction(Intent.ACTION_USER_PRESENT)
         })
         setupMedia()
+        try { getSystemService(CameraManager::class.java).registerTorchCallback(torchCb, h) } catch (_: Exception) {}
+        h.postDelayed({ torchReady = true }, 1500)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -242,12 +257,41 @@ class IslandService : Service() {
         instance = null
         h.removeCallbacksAndMessages(null)
         try { unregisterReceiver(power) } catch (_: Exception) {}
+        try { getSystemService(CameraManager::class.java).unregisterTorchCallback(torchCb) } catch (_: Exception) {}
         controller?.unregisterCallback(mcb)
         try {
             sessionListener?.let { getSystemService(MediaSessionManager::class.java).removeOnActiveSessionsChangedListener(it) }
         } catch (_: Exception) {}
         try { wm.removeView(root) } catch (_: Exception) {}
         super.onDestroy()
+    }
+
+    private fun attachWindow() {
+        val a = IslandAccess.instance
+        wm = (a ?: this).getSystemService(WINDOW_SERVICE) as WindowManager
+        lp.type = if (a != null) WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+                  else WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        wm.addView(root, lp)
+    }
+
+    fun rebuildWindow() {
+        h.post {
+            try { wm.removeView(root) } catch (_: Exception) {}
+            lp.width = WindowManager.LayoutParams.WRAP_CONTENT
+            lp.height = WindowManager.LayoutParams.WRAP_CONTENT
+            try { attachWindow() } catch (_: Exception) {}
+            styleNow(); shownSig = ""; doRefresh()
+        }
+    }
+
+    private fun setFocusable(on: Boolean) {
+        lp.flags = if (on) lp.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
+                   else lp.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        try { wm.updateViewLayout(root, lp) } catch (_: Exception) {}
+    }
+
+    private fun hideIme() {
+        try { (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(root.windowToken, 0) } catch (_: Exception) {}
     }
 
     private fun startAsForeground() {
@@ -483,8 +527,13 @@ class IslandService : Service() {
         val tp = temp
         when {
             cv != null -> show("call:$callKey", true, base()) { cv }
-            nf != null -> show("n:${nf.key}:$notifExpanded:${nf.text}", true, base()) { buildNotif(nf, notifExpanded) }
+            nf != null -> {
+                val ra = replyAction
+                if (replyMode && ra != null) show("r:${nf.key}", true, base()) { buildReply(nf, ra) }
+                else show("n:${nf.key}:$notifExpanded:${nf.text}", true, base()) { buildNotif(nf, notifExpanded) }
+            }
             tp != null -> show("t:$tempId", false, tempColor, tempW) { tp }
+            torchOn && cfg.b("t_torch") -> show("torch", false, base()) { buildTorch() }
             mediaVisible() -> {
                 val expanded = mediaExpanded
                 show("m:$trackKey:$expanded:${isPlaying()}:${timerEnd > System.currentTimeMillis()}:${repeatOn}:${favs().contains(trackKey)}",
@@ -532,6 +581,7 @@ class IslandService : Service() {
 
     private fun finishNotif() {
         h.removeCallbacks(notifTimer)
+        if (replyMode) { replyMode = false; hideIme(); setFocusable(false) }
         notif = null; notifExpanded = false
         if (queue.isNotEmpty()) h.postDelayed(nextR, 250) else doRefresh()
     }
@@ -560,19 +610,27 @@ class IslandService : Service() {
             tx.addView(tv(if (expanded) n.big else n.text, 13f, 0xCCFFFFFF.toInt(), false, if (expanded) 6 else 2))
         }
         head.addView(tx, ll(0, WRAP, 1f))
+        val reply = n.actions.firstOrNull { a -> a.remoteInputs?.isNotEmpty() == true && a.actionIntent != null }
+        if (reply != null && !expanded) {
+            head.addView(circleBtn("↩", 0x33FFFFFF) { startReply(n, reply) }, ll(dp(36), dp(36)).apply { marginStart = dp(8) })
+        }
         col.addView(head)
 
         if (expanded) {
-            val acts = n.actions.filter { it.remoteInputs == null && it.actionIntent != null }.take(3)
-            if (acts.isNotEmpty()) {
+            val others = n.actions.filter { it.remoteInputs == null && it.actionIntent != null }.take(2)
+            if (reply != null || others.isNotEmpty()) {
                 val ar = row().apply { setPadding(0, dp(10), 0, 0) }
-                acts.forEach { a ->
-                    val b = tv(a.title.toString(), 13f, Color.WHITE, true)
+                fun chip(label: String, fill: Int, click: () -> Unit) {
+                    val b = tv(label, 13f, Color.WHITE, true)
                     b.gravity = Gravity.CENTER
                     b.setPadding(dp(14), dp(8), dp(14), dp(8))
-                    b.background = GradientDrawable().apply { setColor(0x33FFFFFF); cornerRadius = dp(18).toFloat() }
-                    b.setOnClickListener { try { a.actionIntent?.send() } catch (_: Exception) {}; finishNotif() }
+                    b.background = GradientDrawable().apply { setColor(fill); cornerRadius = dp(18).toFloat() }
+                    b.setOnClickListener { click() }
                     ar.addView(b, ll(0, WRAP, 1f).apply { marginEnd = dp(6) })
+                }
+                if (reply != null) chip("↩ " + t("Reply", "رد"), accent) { startReply(n, reply) }
+                others.forEach { a ->
+                    chip(a.title.toString(), 0x33FFFFFF) { try { a.actionIntent?.send() } catch (_: Exception) {}; finishNotif() }
                 }
                 col.addView(ar)
             }
@@ -612,8 +670,65 @@ class IslandService : Service() {
         return col
     }
 
+    /* ---------- quick reply ---------- */
+    private fun startReply(n: Notif, reply: Notification.Action) {
+        replyMode = true; replyAction = reply
+        h.removeCallbacks(notifTimer); h.postDelayed(notifTimer, 90000)
+        setFocusable(true)
+        shownSig = ""; doRefresh()
+        h.postDelayed({
+            replyEdit?.let {
+                it.requestFocus()
+                try { (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager).showSoftInput(it, 0) } catch (_: Exception) {}
+            }
+        }, 300)
+    }
+
+    private fun endReply() {
+        replyMode = false; hideIme(); setFocusable(false)
+        armNotif(); shownSig = ""; doRefresh()
+    }
+
+    private fun sendReply(n: Notif, a: Notification.Action, text: String) {
+        if (text.isBlank()) return
+        try {
+            val ris = a.remoteInputs
+            if (ris != null) {
+                val i = Intent()
+                val b = Bundle()
+                ris.forEach { b.putCharSequence(it.resultKey, text) }
+                RemoteInput.addResultsToIntent(ris, i, b)
+                a.actionIntent.send(this, 0, i)
+            }
+        } catch (_: Exception) {}
+        finishNotif()
+        val r = row().apply { setPadding(dp(14), dp(6), dp(16), dp(6)); gravity = Gravity.CENTER }
+        r.addView(tv("✓ " + t("Sent", "تم الإرسال"), 14f, 0xFF30D158.toInt(), true))
+        setTemp(r, 1500, base(), 170)
+    }
+
+    private fun buildReply(n: Notif, reply: Notification.Action): View {
+        val r = row().apply { setPadding(dp(14), dp(10), dp(10), dp(10)) }
+        r.addView(avatar(n.large, n.icon, if (n.color != 0) n.color else accent, dp(36)), ll(dp(36), dp(36)))
+        val et = EditText(this).apply {
+            hint = t("Reply to ", "رد على ") + n.title
+            setHintTextColor(0x99FFFFFF.toInt())
+            setTextColor(Color.WHITE)
+            textSize = 15f
+            setBackgroundColor(Color.TRANSPARENT)
+            maxLines = 3
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            setPadding(dp(12), dp(6), dp(8), dp(6))
+        }
+        replyEdit = et
+        r.addView(et, ll(0, WRAP, 1f))
+        r.addView(circleBtn("➤", accent) { sendReply(n, reply, et.text.toString()) }, ll(dp(38), dp(38)))
+        r.addView(circleBtn("✕", 0x33FFFFFF) { endReply() }, ll(dp(38), dp(38)).apply { marginStart = dp(6) })
+        return r
+    }
+
     /* ---------- calls ---------- */
-    fun showCall(key: String, title: String, text: String, large: Drawable?, actions: List<Notification.Action>) {
+    fun showCall(key: String, title: String, text: String, large: Drawable?, answer: PendingIntent?, decline: PendingIntent?) {
         h.post {
             callKey = key
             val r = row().apply { setPadding(dp(14), dp(12), dp(14), dp(12)) }
@@ -622,17 +737,13 @@ class IslandService : Service() {
             tx.addView(tv(title, 16f, Color.WHITE, true))
             tx.addView(tv(if (text.isEmpty()) t("Incoming call", "مكالمة واردة") else text, 13f, 0xB3FFFFFF.toInt()))
             r.addView(tx, ll(0, WRAP, 1f))
-            actions.take(2).forEach { a ->
-                val tt = a.title.toString()
-                val bad = listOf("decline", "reject", "hang", "end", "رفض", "إنهاء", "انهاء")
-                    .any { tt.contains(it, ignoreCase = true) }
-                r.addView(
-                    circleBtn(if (bad) "✕" else "✓", if (bad) 0xFFFF453A.toInt() else 0xFF30D158.toInt()) {
-                        try { a.actionIntent?.send() } catch (_: Exception) {}
-                    },
-                    ll(dp(46), dp(46)).apply { marginStart = dp(8) }
-                )
+            fun btn(glyph: String, color: Int, pi: PendingIntent?) {
+                if (pi == null) return
+                r.addView(circleBtn(glyph, color) { try { pi.send() } catch (_: Exception) {} },
+                    ll(dp(46), dp(46)).apply { marginStart = dp(8) })
             }
+            btn("✕", 0xFFFF453A.toInt(), decline)
+            btn("✓", 0xFF30D158.toInt(), answer)
             callView = r
             doRefresh()
         }
@@ -672,6 +783,33 @@ class IslandService : Service() {
             timerTv?.text = mmss(left)
             h.postDelayed(this, 1000)
         }
+    }
+
+    /* ---------- flashlight ---------- */
+    private val torchCb = object : CameraManager.TorchCallback() {
+        override fun onTorchModeChanged(cameraId: String, enabled: Boolean) {
+            if (torchOn == enabled) return
+            torchOn = enabled; torchId = cameraId
+            if (torchReady && cfg.b("t_torch")) torchToast(enabled) else doRefresh()
+        }
+    }
+
+    private fun torchToast(on: Boolean) {
+        val r = row().apply { setPadding(dp(14), dp(6), dp(16), dp(6)); gravity = Gravity.CENTER }
+        r.addView(tv("🔦", 20f), ll(WRAP, WRAP).apply { marginEnd = dp(8) })
+        r.addView(tv(if (on) t("Flashlight on", "تم تشغيل الكشاف") else t("Flashlight off", "تم إيقاف الكشاف"),
+            14f, if (on) 0xFFFFD60A.toInt() else Color.WHITE, true))
+        setTemp(r, 1600, base(), 200)
+    }
+
+    private fun buildTorch(): View {
+        val r = row().apply { setPadding(dp(14), dp(4), dp(14), dp(4)); gravity = Gravity.CENTER }
+        r.addView(tv("🔦  ", 16f))
+        r.addView(tv("ON", 14f, 0xFFFFD60A.toInt(), true))
+        r.setOnClickListener {
+            try { getSystemService(CameraManager::class.java).setTorchMode(torchId ?: return@setOnClickListener, false) } catch (_: Exception) {}
+        }
+        return r
     }
 
     /* ---------- lock / unlock ---------- */
@@ -755,13 +893,23 @@ class IslandService : Service() {
         val m = controller?.metadata
         val key = (m?.getString(MediaMetadata.METADATA_KEY_TITLE) ?: "") + "|" +
                 (m?.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: "")
-        if (key == trackKey) return
+        if (key == trackKey && artBmp != null) return
         trackKey = key
         artBmp = m?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
             ?: m?.getBitmap(MediaMetadata.METADATA_KEY_ART)
             ?: m?.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON)
         applyArtColors()
         if (artBmp == null && m != null) loadArtUri(m, key)
+        if (artBmp == null) h.postDelayed({
+            if (trackKey == key && artBmp == null) fallbackArt?.let { artBmp = it; applyArtColors(); shownSig = ""; doRefresh() }
+        }, 900)
+    }
+
+    fun mediaArtFallback(b: Bitmap) {
+        h.post {
+            fallbackArt = b
+            if (artBmp == null) { artBmp = b; applyArtColors(); shownSig = ""; doRefresh() }
+        }
     }
 
     private fun loadArtUri(m: MediaMetadata, key: String) {
@@ -770,7 +918,7 @@ class IslandService : Service() {
             ?: m.getString(MediaMetadata.METADATA_KEY_DISPLAY_ICON_URI) ?: return
         Thread {
             try {
-                val bmp = contentResolver.openInputStream(Uri.parse(uri))?.use { BitmapFactory.decodeStream(it) }
+                val bmp = (if (uri.startsWith("http")) java.net.URL(uri).openStream() else contentResolver.openInputStream(Uri.parse(uri)))?.use { BitmapFactory.decodeStream(it) }
                 if (bmp != null) h.post {
                     if (trackKey == key) { artBmp = bmp; applyArtColors(); shownSig = ""; doRefresh() }
                 }
@@ -792,7 +940,8 @@ class IslandService : Service() {
 
     private fun dominant(b: Bitmap): Int {
         return try {
-            val s = Bitmap.createScaledBitmap(b, 24, 24, true)
+            val src = if (b.config == Bitmap.Config.HARDWARE) b.copy(Bitmap.Config.ARGB_8888, false) else b
+            val s = Bitmap.createScaledBitmap(src, 24, 24, true)
             var r = 0.0; var g = 0.0; var bl = 0.0; var ws = 0.0
             val hsv = FloatArray(3)
             for (x in 0 until 24) for (y in 0 until 24) {
