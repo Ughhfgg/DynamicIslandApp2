@@ -38,6 +38,7 @@ class MainActivity : Activity() {
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun t(en: String, a: String) = if (ar) a else en
     private fun running() = IslandService.instance != null
+    private fun ready() = Settings.canDrawOverlays(this) || IslandAccess.instance != null
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
@@ -226,7 +227,7 @@ class MainActivity : Activity() {
         pb.setOnClickListener {
             if (running()) {
                 stopService(Intent(this, IslandService::class.java))
-            } else if (Settings.canDrawOverlays(this)) {
+            } else if (ready()) {
                 startForegroundService(Intent(this, IslandService::class.java))
             } else {
                 Toast.makeText(this, t("Enable overlay permission first", "فعّل إذن الظهور فوق التطبيقات أولاً"), Toast.LENGTH_LONG).show()
@@ -241,6 +242,9 @@ class MainActivity : Activity() {
         statusRow(setup, "Display over other apps", "الظهور فوق التطبيقات", { Settings.canDrawOverlays(this) }) {
             startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
         }
+        statusRow(setup, "Above system island (Accessibility)", "الظهور فوق جزيرة النظام (إمكانية الوصول)", { IslandAccess.instance != null }) {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        }
         statusRow(setup, "Notification access", "الوصول إلى الإشعارات", {
             (Settings.Secure.getString(contentResolver, "enabled_notification_listeners") ?: "").contains(packageName)
         }) { startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }
@@ -254,6 +258,7 @@ class MainActivity : Activity() {
         switchRow(feat, "Notifications", "الإشعارات", "t_notif")
         switchRow(feat, "Incoming calls", "المكالمات الواردة", "t_call")
         switchRow(feat, "Charging & battery", "الشحن والبطارية", "t_charge")
+        switchRow(feat, "Flashlight indicator", "مؤشر الكشاف", "t_torch")
         switchRow(feat, "Lock / unlock animation", "حركة القفل وفتح القفل", "t_lock")
         switchRow(feat, "Adaptive color from album art", "لون متكيّف مع غلاف الأغنية", "adaptive")
         switchRow(feat, "Equalizer animation", "حركة المعادل الصوتي", "t_wave")
@@ -295,7 +300,7 @@ class MainActivity : Activity() {
         tm.addView(et, lpv(top = 6))
         button(tm, t("Start timer", "ابدأ المؤقت"), true) {
             val m = et.text.toString().toIntOrNull() ?: 0
-            if (m > 0 && Settings.canDrawOverlays(this)) {
+            if (m > 0 && ready()) {
                 startForegroundService(Intent(this, IslandService::class.java)
                     .setAction(IslandService.ACTION_TIMER).putExtra(IslandService.EXTRA_SECONDS, m * 60))
             } else Toast.makeText(this, t("Enter minutes and enable permission", "أدخل الدقائق وفعّل الإذن"), Toast.LENGTH_SHORT).show()
