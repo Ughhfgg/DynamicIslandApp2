@@ -456,44 +456,84 @@ class IslandService : Service() {
         curColor = target; curRad = radius
     }
 
+    private var lastExp = false
+    private var lastW = 0
+    private var morphPending = false
+    private var pV: View? = null
+    private var pExp = false
+    private var pColor = 0
+    private var pWdp = 0
+
+    private fun targetW(expanded: Boolean, wDp: Int): Int =
+        if (expanded) (resources.displayMetrics.widthPixels * cfg.i("expw", 94) / 100f).toInt()
+        else dp(if (wDp > 0) wDp else cfg.d("width"))
+
+    private fun radiusFor(expanded: Boolean): Float =
+        if (expanded) dp(cfg.i("radius", 30)).toFloat() else dp(cfg.d("height") / 2).toFloat()
+
+    // Runs after the window has already been enlarged, so the capsule grows symmetrically (no jump)
+    private val morphR = Runnable {
+        val v = pV ?: return@Runnable
+        morphPending = false
+        box.alpha = 1f; box.scaleX = 1f; box.scaleY = 1f; box.translationY = 0f
+        val set = TransitionSet()
+        set.setOrdering(TransitionSet.ORDERING_TOGETHER)
+        set.addTransition(ChangeBounds())
+        set.addTransition(Fade())
+        set.setDuration(320)
+        set.setInterpolator(OvershootInterpolator(0.35f))
+        set.addListener(object : TransitionListenerAdapter() {
+            override fun onTransitionEnd(transition: Transition) { if (!morphPending) windowBig(false) }
+        })
+        TransitionManager.beginDelayedTransition(root, set)
+        applyBox(pExp, pWdp)
+        box.removeAllViews()
+        box.addView(v, ll(MATCH, WRAP))
+        setBg(pColor, radiusFor(pExp), true)
+    }
+
     private fun present(v: View, expanded: Boolean, color: Int, wDp: Int = 0) {
         val appearing = root.visibility != View.VISIBLE
-        val rad = if (expanded) dp(cfg.i("radius", 30)).toFloat() else dp(cfg.d("height") / 2).toFloat()
-        box.animate().cancel()
+        val tw = targetW(expanded, wDp)
         if (appearing) {
+            h.removeCallbacks(morphR); morphPending = false
+            box.animate().cancel()
             windowBig(false)
             applyBox(expanded, wDp)
             box.removeAllViews()
             box.addView(v, ll(MATCH, WRAP))
-            setBg(color, rad, false)
+            setBg(color, radiusFor(expanded), false)
             root.visibility = View.VISIBLE
             box.alpha = 0f; box.scaleX = 0.6f; box.scaleY = 0.6f; box.translationY = -dp(16).toFloat()
             box.animate().alpha(1f).scaleX(1f).scaleY(1f).translationY(0f)
                 .setDuration(340).setInterpolator(OvershootInterpolator(1.1f)).start()
             haptic()
-        } else {
+        } else if (morphPending) {
+            pV = v; pExp = expanded; pColor = color; pWdp = wDp
+        } else if (expanded == lastExp && abs(tw - lastW) < dp(2)) {
+            // same size: just swap the content smoothly, the window is never touched
+            box.animate().cancel()
             box.alpha = 1f; box.scaleX = 1f; box.scaleY = 1f; box.translationY = 0f
-            windowBig(true)
-            val set = TransitionSet()
-            set.setOrdering(TransitionSet.ORDERING_TOGETHER)
-            set.addTransition(ChangeBounds())
-            set.addTransition(Fade())
-            set.setDuration(300)
-            set.setInterpolator(OvershootInterpolator(0.7f))
-            set.addListener(object : TransitionListenerAdapter() {
-                override fun onTransitionEnd(transition: Transition) { windowBig(false) }
-            })
-            TransitionManager.beginDelayedTransition(root, set)
-            applyBox(expanded, wDp)
             box.removeAllViews()
             box.addView(v, ll(MATCH, WRAP))
-            setBg(color, rad, true)
+            v.alpha = 0f
+            v.animate().alpha(1f).setDuration(180).start()
+            setBg(color, radiusFor(expanded), true)
+        } else {
+            // size change: enlarge the window first, then animate the capsule inside it
+            box.animate().cancel()
+            pV = v; pExp = expanded; pColor = color; pWdp = wDp
+            morphPending = true
+            windowBig(true)
+            h.postDelayed(morphR, 60)
         }
+        lastExp = expanded; lastW = tw
     }
 
     private fun hide() {
         if (root.visibility != View.VISIBLE) return
         shownSig = ""
+        h.removeCallbacks(morphR); morphPending = false
         box.animate().alpha(0f).scaleX(0.6f).scaleY(0.6f).translationY(-dp(12).toFloat())
             .setDuration(220).withEndAction {
                 if (shownSig.isEmpty()) {
