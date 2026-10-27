@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="island_access_desc">Shows the Dynamic Island above the system island</string>
+</resources>
